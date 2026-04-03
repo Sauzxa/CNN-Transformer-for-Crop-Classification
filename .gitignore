@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+**/__pycache__/
+.ipynb_checkpoints/
+.checkpoints/
+
+# Local dataset (very large)
+dataset/
+
+# Python
+*.pyc
+*.pyo
+*.pyd
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
