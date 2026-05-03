@@ -16,3 +16,8 @@ dataset/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# California : donnees traitees, poids et rasters (trop volumineux pour GitHub)
+california/processed_data/
+california/runs/
+california/dataset/
