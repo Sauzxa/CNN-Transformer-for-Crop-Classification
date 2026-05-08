@@ -3,9 +3,13 @@ __pycache__/
 **/__pycache__/
 .ipynb_checkpoints/
 .checkpoints/
+*.h5
+*.weights.h5
 
 # Local dataset (very large)
 dataset/
+*.tif
+*.png
 
 # Python
 *.pyc
