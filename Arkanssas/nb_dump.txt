@@ -1,0 +1,1061 @@
+CELL 0:
+from pathlib import Path
+
+PROJECT_ROOT = Path.cwd()
+if PROJECT_ROOT.name == "notebooks":
+    PROJECT_ROOT = PROJECT_ROOT.parent
+
+DATASET_DIR = PROJECT_ROOT / "dataset"
+CDL_RASTER_PATH = DATASET_DIR / "cdl_area1.tif"
+
+
+# ── NOUVELLE structure : dossiers MCTNet_AreaX avec 36 .tif ──────────────────
+AREA1_DIR = DATASET_DIR / "MCTNet_Area1"   # 36 fichiers .tif (timestamps)
+AREA2_DIR = DATASET_DIR / "MCTNet_Area2"   # 36 fichiers .tif (timestamps)
+
+# Bandes dans chaque .tif (ordre du papier MCTNet)
+# Chaque .tif contient 10 bandes dans cet ordre :
+S2_BANDS = ("B02", "B03", "B04", "B08", "B05", "B06", "B07", "B8A", "B11", "B12")
+N_BANDS   = len(S2_BANDS)    # 10
+N_TIMESTEPS = 36              # 36 images par zone
+
+BATCH_SIZE    = 64
+EPOCHS_DEFAULT = 150          # comme le papier (patience via EarlyStopping)
+LEARNING_RATE = 1e-3
+VAL_FRACTION  = 0.2
+SEED          = 42
+
+CDL_IGNORE_VALUES = (0,)
+
+print(f"PROJECT_ROOT = {PROJECT_ROOT}")
+print(f"Area1 TIFs   = {len(sorted(AREA1_DIR.glob('*.tif')))} fichiers")
+print(f"Area2 TIFs   = {len(sorted(AREA2_DIR.glob('*.tif')))} fichiers")
+
+CELL 3:
+import numpy as np
+import rasterio
+from rasterio.warp import reproject, Resampling as WarpResampling
+from typing import List, Tuple
+
+
+def load_tif_list(area_dir: Path) -> List[Path]:
+    """Retourne les 36 .tif triés par nom (= ordre temporel)."""
+    tifs = sorted(area_dir.glob("*.tif"))
+    if len(tifs) == 0:
+        raise FileNotFoundError(f"Aucun .tif dans {area_dir}")
+    return tifs
+
+
+def read_tif_bands(tif_path: Path, n_bands: int = 10) -> np.ndarray:
+    """
+    Lit un .tif multi-bandes → array (H, W, n_bands) float32.
+    Les pixels nodata sont mis à NaN.
+    """
+    with rasterio.open(tif_path) as src:
+        # src.count = nombre de bandes dans le fichier
+        bands_to_read = min(n_bands, src.count)
+        arr = src.read(list(range(1, bands_to_read + 1))).astype(np.float32)  # (B, H, W)
+        nodata = src.nodata
+        if nodata is not None:
+            arr = np.where(arr == nodata, np.nan, arr)
+        arr = arr.transpose(1, 2, 0)  # → (H, W, B)
+    return arr
+
+
+def get_tif_transform(tif_path: Path):
+    """Retourne (transform, crs, height, width) du premier .tif."""
+    with rasterio.open(tif_path) as src:
+        return src.transform, src.crs, src.height, src.width
+
+
+def load_cdl_labels(path: Path):
+    """Charge le raster CDL → array (H, W) int32 + profile."""
+    with rasterio.open(path) as src:
+        y = src.read(1).astype(np.int32)
+        profile = src.profile
+    return y, profile
+
+
+def reproject_cdl_to_tif(cdl_path: Path, ref_tif_path: Path) -> np.ndarray:
+    """
+    Reprojette / rééchantillonne le CDL sur la grille du premier .tif.
+    Indispensable si CDL et S2 n'ont pas la même résolution / CRS.
+    """
+    with rasterio.open(ref_tif_path) as ref:
+        ref_transform = ref.transform
+        ref_crs = ref.crs
+        ref_height = ref.height
+        ref_width = ref.width
+
+    with rasterio.open(cdl_path) as src:
+        dst_arr = np.empty((ref_height, ref_width), dtype=np.int32)
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst_arr,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=ref_transform,
+            dst_crs=ref_crs,
+            resampling=WarpResampling.nearest,  # nearest pour labels entiers !
+        )
+    return dst_arr
+
+
+def scale_to_reflectance(x: np.ndarray) -> np.ndarray:
+    """DN L2A (0-10000) → réflectance (0-1). Ignore les NaN."""
+    x = np.asarray(x, dtype=np.float32)
+    return np.where(x > 1.5, x / 10000.0, np.clip(x, 0.0, 1.0))
+
+
+def add_spectral_indices_pixel(X: np.ndarray) -> np.ndarray:
+    """
+    Ajoute NDVI et NDWI à X de forme (N, T, C).
+    Ordre des bandes = S2_BANDS : B02=0, B03=1, B04=2, B08=3
+    """
+    eps = 1e-6
+    X_ref = scale_to_reflectance(X)
+    B03 = X_ref[:, :, 1]  # Green
+    B04 = X_ref[:, :, 2]  # Red
+    B08 = X_ref[:, :, 3]  # NIR
+    ndvi = (B08 - B04) / (B08 + B04 + eps)
+    ndwi = (B03 - B08) / (B03 + B08 + eps)
+    X_out = np.concatenate(
+        [X_ref, ndvi[..., None], ndwi[..., None]], axis=-1
+    ).astype(np.float32)
+    return X_out
+
+CELL 5:
+from sklearn.model_selection import train_test_split
+
+def remap_labels(raw: np.ndarray, ignore=(0,)):
+    ignore_set = set(int(x) for x in ignore)
+    codes = sorted(int(c) for c in np.unique(raw) if c not in ignore_set and c >= 0)
+    code_to_idx = {c: i for i, c in enumerate(codes)}
+    out = np.full_like(raw, -1, dtype=np.int32)
+    for c, i in code_to_idx.items():
+        out[raw == c] = i
+    rev = {i: c for c, i in code_to_idx.items()}
+    return out, rev
+
+
+def select_pixel_indices_stratified(
+    labels_hw: np.ndarray,
+    max_samples: int,
+    min_per_class: int = 2000,
+    seed: int = 42,
+):
+    """
+    Garantit min_per_class échantillons pour chaque classe,
+    puis complète avec Others jusqu'à max_samples.
+    """
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    flat_y = labels_hw.reshape(-1)
+    valid = flat_y >= 0
+    classes = np.unique(flat_y[valid])
+    h, w = labels_hw.shape
+
+    parts = []
+    for cl in classes:
+        pos = np.flatnonzero(valid & (flat_y == cl))
+        if pos.size == 0:
+            continue
+        # Prend le max disponible, au moins min_per_class si possible
+        n_take = min(min_per_class, pos.size)
+        parts.append(rng.choice(pos, size=n_take, replace=True))  # replace=True si insuffisant
+
+    idx = np.concatenate(parts)
+    if idx.size > max_samples:
+        idx = rng.choice(idx, size=max_samples, replace=False)
+
+    rows = (idx // w).astype(np.int32)
+    cols = (idx % w).astype(np.int32)
+    y = flat_y[idx].astype(np.int32)
+    return rows, cols, y
+
+
+def build_pixel_dataset_from_tifs(
+    area_dir: Path,
+    cdl_labels_hw: np.ndarray,       # CDL déjà reprojeté sur la grille .tif
+    max_samples: int = 10_000,
+    seed: int = 42,
+    n_bands: int = 10,
+    add_indices: bool = True,
+    stratified: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Lit les 36 .tif de area_dir, extrait des pixels échantillonnés.
+
+    Retourne :
+        X            : (N, T=36, C)  float32  — valeurs 0 pour données manquantes
+        y            : (N,)          int32
+        mask_valid   : (N, T)        bool     — True si timestamp non-manquant
+    """
+    tif_paths = load_tif_list(area_dir)
+    T = len(tif_paths)  # doit être 36
+
+    # 1) Choisir les pixels
+    if stratified:
+        rows, cols, y = select_pixel_indices_stratified(
+            cdl_labels_hw, max_samples=max_samples, seed=seed
+        )
+    else:
+        rng = np.random.default_rng(seed)
+        flat_y = cdl_labels_hw.reshape(-1)
+        idx = np.flatnonzero(flat_y >= 0)
+        if idx.size > max_samples:
+            idx = rng.choice(idx, size=max_samples, replace=False)
+        h, w = cdl_labels_hw.shape
+        rows = (idx // w).astype(np.int32)
+        cols = (idx % w).astype(np.int32)
+        y = flat_y[idx].astype(np.int32)
+
+    N = rows.size
+    X = np.zeros((N, T, n_bands), dtype=np.float32)  # 0 = valeur manquante (convention papier)
+
+    # 2) Lire chaque timestamp
+    for ti, tif_path in enumerate(tif_paths):
+        arr_hwb = read_tif_bands(tif_path, n_bands=n_bands)  # (H, W, B)
+        pixel_vals = arr_hwb[rows, cols, :]                  # (N, B)
+        # Remplace NaN par 0 (convention du papier : 0 = missing)
+        pixel_vals = np.where(np.isnan(pixel_vals), 0.0, pixel_vals)
+        X[:, ti, :] = pixel_vals
+
+    # 3) Masque temporel : True si au moins une bande non-nulle
+    mask_valid = np.any(X != 0.0, axis=-1)  # (N, T)
+
+    # 4) Option indices spectraux
+    if add_indices:
+        X = add_spectral_indices_pixel(X)  # (N, T, 12)
+
+    return X, y, mask_valid
+
+CELL 6:
+import sys
+print(sys.executable)
+from pathlib import Path
+print(Path.cwd())
+
+CELL 8:
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+
+def build_mlp_baseline(n_timesteps, n_channels, n_classes, hidden=128):
+    inp = keras.Input(shape=(n_timesteps, n_channels))
+    x = layers.Flatten()(inp)
+    x = layers.Dense(hidden, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    x = layers.Dense(hidden // 2, activation="relu")(x)
+    out = layers.Dense(n_classes, activation="softmax")(x)
+    return keras.Model(inp, out, name="mlp_baseline")
+
+
+def build_cnn_transformer(
+    n_timesteps,
+    n_channels,
+    n_classes,
+    d_model=64,
+    num_heads=4,
+    ff_dim=128,
+    num_transformer_blocks=2,
+    dropout=0.1,
+):
+    inp = keras.Input(shape=(n_timesteps, n_channels))
+    x = layers.Conv1D(d_model, kernel_size=1, activation="relu", padding="same")(inp)
+    x = layers.Conv1D(d_model, kernel_size=3, activation="relu", padding="same")(x)
+    for _ in range(num_transformer_blocks):
+        xa = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=max(1, d_model // num_heads), dropout=dropout
+        )(x, x)
+        x = layers.LayerNormalization(epsilon=1e-6)(x + xa)
+        xf = layers.Dense(ff_dim, activation="relu")(x)
+        xf = layers.Dense(d_model)(xf)
+        x = layers.LayerNormalization(epsilon=1e-6)(x + xf)
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dropout(dropout)(x)
+    out = layers.Dense(n_classes, activation="softmax")(x)
+    return keras.Model(inp, out, name="cnn_transformer_sits")
+
+
+def compile_model(model, learning_rate):
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+
+CELL 10:
+# ═══════════════════════════════════════════════════════
+#  CHARGEMENT DES DONNÉES RÉELLES — MCTNet_Area1 + Area2
+# ═══════════════════════════════════════════════════════
+
+MAX_SAMPLES = 50_000        # plus de pixels à échantillonner
+SAMPLES_PER_CLASS = 2000    # forcer un minimum par classe agricole
+ADD_SPECTRAL_INDICES = True
+USE_STRATIFIED_SAMPLING = True
+
+USE_PAPER_5_CLASSES = True
+PAPER_LABELS = ["Corn", "Cotton", "Soybean", "Rice", "Others"]
+
+# ── Reprojection CDL ──────────────────────────────────────────────────────────
+ref_tif = load_tif_list(AREA1_DIR)[0]
+print("Reprojection CDL → grille Sentinel-2...")
+y_raw_reproj = reproject_cdl_to_tif(CDL_RASTER_PATH, ref_tif)
+
+# ── Mapper vers 5 classes IMMÉDIATEMENT (avant sampling) ─────────────────────
+def map_cdl_to_5classes(cdl_arr: np.ndarray) -> np.ndarray:
+    """
+    Convertit les codes CDL bruts vers 5 classes papier.
+    Pixels hors classes → -1 (ignorés par le sampler).
+    """
+    out = np.full_like(cdl_arr, -1, dtype=np.int32)
+    out[cdl_arr == 1]  = 0   # Corn
+    out[cdl_arr == 2]  = 1   # Cotton
+    out[cdl_arr == 5]  = 2   # Soybean
+    out[cdl_arr == 3]  = 3   # Rice
+    # Others = tout ce qui est culture (codes 1-60) sauf les 4 ci-dessus
+    CROP_CODES = set(range(1, 61))
+    MAIN_CODES = {1, 2, 3, 5}
+    for code in CROP_CODES - MAIN_CODES:
+        out[cdl_arr == code] = 4
+    return out
+
+y_5classes_area1 = map_cdl_to_5classes(y_raw_reproj)
+
+print("Distribution 5 classes dans Area1 (pixels totaux) :")
+for i, name in enumerate(PAPER_LABELS):
+    count = np.sum(y_5classes_area1 == i)
+    print(f"  {name:10s} : {count:8d} pixels")
+
+# ── Échantillonnage équilibré sur les 5 classes ───────────────────────────────
+SAMPLES_PER_CLASS = 2000   # → 10 000 total, 2000 par classe
+MAX_SAMPLES       = SAMPLES_PER_CLASS * 5
+
+print(f"\nExtraction pixels Area1 ({SAMPLES_PER_CLASS}/classe)...")
+X, y, mask_time = build_pixel_dataset_from_tifs(
+    AREA1_DIR,
+    y_5classes_area1,        # ← labels déjà en 5 classes
+    max_samples=MAX_SAMPLES,
+    seed=SEED,
+    n_bands=N_BANDS,
+    add_indices=ADD_SPECTRAL_INDICES,
+    stratified=True,
+)
+n_classes = 5
+print(f"  X shape : {X.shape}")
+print("Distribution réelle :")
+for i, name in enumerate(PAPER_LABELS):
+    print(f"  {name:10s} : {np.sum(y == i):5d}")
+
+# ── Split train/val STRATIFIÉ ─────────────────────────────────────────────────
+X_train, X_val, y_train, y_val, mask_train, mask_val = train_test_split(
+    X, y, mask_time,
+    test_size=VAL_FRACTION,
+    random_state=SEED,
+    stratify=y,         # ← crucial pour équilibrer val aussi
+)
+print(f"\nTrain : {X_train.shape}  |  Val : {X_val.shape}")
+
+# ── Normalisation des features (Fix 5) ────────────────────────────────────────
+from sklearn.preprocessing import StandardScaler
+
+# Fit UNIQUEMENT sur train, applique sur val
+scaler = StandardScaler()
+N_tr, T, C = X_train.shape
+X_train = scaler.fit_transform(
+    X_train.reshape(-1, C)
+).reshape(N_tr, T, C).astype(np.float32)
+
+N_val = X_val.shape[0]
+X_val = scaler.transform(
+    X_val.reshape(-1, C)
+).reshape(N_val, T, C).astype(np.float32)
+print("Normalisation appliquée.")
+
+CELL 11:
+# Mis à jour automatiquement depuis les données chargées
+N_TIMESTEPS = X_train.shape[1]   
+N_CHANNELS  = X_train.shape[2]   
+                                 
+N_CLASSES   = n_classes          
+
+print(f"Modèle MCTNet : T={N_TIMESTEPS}, C={N_CHANNELS}, classes={N_CLASSES}")
+
+CELL 13:
+EPOCHS = 50
+BATCH_SIZE_RUN = BATCH_SIZE
+LR = LEARNING_RATE
+
+# --- Déséquilibre (Others >> autres) : sur-échantillonner le train + callbacks robustes ---
+import sys
+sys.path.insert(0, str(PROJECT_ROOT))
+from training_utils import oversample_balanced, ScalarEarlyStopping, sparse_categorical_focal_loss
+
+USE_BALANCED_OVERSAMPLE = True  # même effectif par classe = entraînement proche de l’article
+USE_FOCAL_LOSS = False  # True = focal loss (déséquilibre) ; nécessite compile dédiée pour MCTNet
+
+if USE_BALANCED_OVERSAMPLE:
+    X_train_fit, y_train_fit = oversample_balanced(X_train, y_train, seed=SEED)
+    class_weight_fit = None  # déjà équilibré
+    uc, cnt = np.unique(y_train_fit, return_counts=True)
+    print("Train équilibré:", X_train_fit.shape[0], "exemples ; par classe:", dict(zip(uc.tolist(), cnt.tolist())))
+else:
+    X_train_fit, y_train_fit = X_train, y_train
+    from sklearn.utils.class_weight import compute_class_weight
+
+    classes = np.unique(y_train_fit)
+    weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_train_fit)
+    class_weight_fit = {int(c): float(w) for c, w in zip(classes, weights)}
+    print("class_weight:", class_weight_fit)
+
+# MLP : early stopping. MCTNet : toutes les époques + checkpoint meilleure val_loss (anti overfit à l’éval)
+CHECKPOINT_DIR = PROJECT_ROOT / ".checkpoints"
+CHECKPOINT_DIR.mkdir(exist_ok=True)
+# Poids seuls : les couches custom (CTFusion, ALPE, …) ne sont pas sérialisables en .keras complet
+MCTNET_CKPT_PATH = CHECKPOINT_DIR / "mctnet_best.weights.h5"
+
+def _make_reduce_lr():
+    return tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_macro_f1",
+        mode="max",
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6,
+        verbose=1,
+    )
+
+callbacks_mlp = [
+    ScalarEarlyStopping(
+        monitor="val_macro_f1",
+        mode="max",
+        patience=15,
+        min_delta=1e-5,
+        restore_best_weights=True,
+        verbose=1,
+    ),
+    _make_reduce_lr(),
+]
+
+callbacks_mctnet = [
+    tf.keras.callbacks.ModelCheckpoint(
+        filepath=str(MCTNET_CKPT_PATH),
+        monitor="val_macro_f1",
+        mode="max",
+        save_best_only=True,
+        save_weights_only=True,
+        verbose=1,
+    ),
+    _make_reduce_lr(),
+]
+
+callbacks = callbacks_mlp  # rétrocompat si une cellule utilise encore `callbacks`
+
+
+CELL 14:
+mlp = build_mlp_baseline(X_train.shape[1], X_train.shape[2], n_classes)
+compile_model(mlp, LR)
+mlp.summary()
+
+CELL 15:
+history_mlp = mlp.fit(
+    X_train_fit, y_train_fit,
+    validation_data=(X_val, y_val),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE_RUN,
+    verbose=1,
+    class_weight=class_weight_fit,
+    callbacks=callbacks_mlp,
+)
+
+y_pred = np.argmax(mlp.predict(X_val, batch_size=BATCH_SIZE_RUN, verbose=0), axis=1)
+from sklearn.metrics import classification_report
+
+print(classification_report(y_val, y_pred, digits=4))
+
+CELL 16:
+import sys, importlib
+sys.path.append(str(PROJECT_ROOT))
+import mctnet_model
+importlib.reload(mctnet_model)
+from mctnet_model import build_mctnet
+
+CELL 17:
+tf.keras.utils.set_random_seed(SEED)
+
+# MCTNet (article) : ALPE sinusoïdal + ECA, CTFusion × n_stage, max pooling masqué (mctnet_model.py)
+import importlib.util
+import sys
+
+_tu_path = PROJECT_ROOT / "training_utils.py"
+_spec = importlib.util.spec_from_file_location("training_utils", _tu_path)
+_tu = importlib.util.module_from_spec(_spec)
+sys.modules["training_utils"] = _tu
+_spec.loader.exec_module(_tu)
+sparse_categorical_focal_loss = _tu.sparse_categorical_focal_loss
+sparse_categorical_crossentropy_label_smoothing = _tu.sparse_categorical_crossentropy_label_smoothing
+
+sys.path.insert(0, str(PROJECT_ROOT))
+from mctnet_model import build_mctnet   
+
+
+
+ct = build_mctnet(
+    n_timesteps=X_train.shape[1],
+    n_channels=X_train.shape[2],
+    n_classes=n_classes,
+    missing_value=None,
+    d_model=60,
+    num_heads=5,
+    ff_dim=128,
+    n_stage=3,
+    conv_kernel=3,
+    dropout=0.35,
+    l2=1e-4,
+    light=False,
+)
+
+from training_utils import SparseCategoricalFocalLoss, MacroF1Score
+
+ct.compile(
+    optimizer=keras.optimizers.Adam(LR),
+    loss=SparseCategoricalFocalLoss(gamma=2.0),
+    metrics=[
+        "accuracy",
+        MacroF1Score(n_classes=n_classes, name="macro_f1"),
+    ],
+)
+ct.summary()
+
+CELL 18:
+history_ct = ct.fit(
+    X_train_fit, y_train_fit,
+    validation_data=(X_val, y_val),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE_RUN,
+    verbose=1,
+    class_weight=class_weight_fit,
+    callbacks=callbacks_mctnet,
+)
+
+if MCTNET_CKPT_PATH.is_file():
+    ct.load_weights(MCTNET_CKPT_PATH)
+    print("Poids MCTNet rechargés depuis le meilleur checkpoint (val_loss).")
+
+y_pred_ct = np.argmax(ct.predict(X_val, batch_size=BATCH_SIZE_RUN, verbose=0), axis=1)
+print(classification_report(y_val, y_pred_ct, digits=4))
+
+CELL 20:
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+
+# --- Matrices de confusion normalisées (style paper) ---
+def _pretty_labels(n_classes, label_map=None):
+    if label_map is None:
+        return [str(i) for i in range(n_classes)]
+    # label_map: idx -> CDL code
+    return [str(label_map.get(i, i)) for i in range(n_classes)]
+
+
+def _plot_cm_normalized(ax, y_true, y_pred, labels, title):
+    cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(labels)))
+    row_sum = cm.sum(axis=1, keepdims=True)
+    cm_norm = np.divide(cm, np.maximum(row_sum, 1), where=row_sum > 0)
+
+    im = ax.imshow(cm_norm, cmap="Blues", vmin=0.0, vmax=1.0)
+    ax.set_title(title, fontsize=12)
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticklabels(labels)
+
+    # Annotation like paper (3 decimals)
+    for i in range(cm_norm.shape[0]):
+        for j in range(cm_norm.shape[1]):
+            v = cm_norm[i, j]
+            ax.text(
+                j,
+                i,
+                f"{v:.3f}",
+                ha="center",
+                va="center",
+                color="white" if v > 0.5 else "black",
+                fontsize=9,
+            )
+    return im
+
+
+# Labels: si mode papier activé, on affiche Corn/Cotton/Soybean/Rice/Others
+if "USE_PAPER_5_CLASSES" in globals() and USE_PAPER_5_CLASSES:
+    class_labels = PAPER_LABELS
+else:
+    class_labels = _pretty_labels(n_classes, label_map if "label_map" in globals() else None)
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+im1 = _plot_cm_normalized(axes[0], y_val, y_pred, class_labels, "(a) MLP baseline")
+im2 = _plot_cm_normalized(axes[1], y_val, y_pred_ct, class_labels, "(b) CNN-Transformer (MCTNet-like)")
+
+cbar = fig.colorbar(im2, ax=axes.ravel().tolist(), fraction=0.03, pad=0.02)
+cbar.set_label("Normalized value")
+
+plt.tight_layout()
+plt.show()
+
+# --- Courbes d'entraînement (loss + accuracy) ---
+def plot_history(history, title_prefix: str, smooth: float = 0.0):
+    epochs = np.arange(1, len(history.history["loss"]) + 1)
+
+    def maybe_smooth(arr):
+        arr = np.asarray(arr, dtype=np.float32)
+        if smooth <= 0:
+            return arr
+        out = np.copy(arr)
+        for i in range(1, len(arr)):
+            out[i] = smooth * out[i - 1] + (1.0 - smooth) * arr[i]
+        return out
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+
+    tr_loss = maybe_smooth(history.history["loss"])
+    va_loss = maybe_smooth(history.history["val_loss"])
+    axes[0].plot(epochs, tr_loss, label="train", linewidth=2)
+    axes[0].plot(epochs, va_loss, label="val", linewidth=2)
+    axes[0].set_title(f"{title_prefix} - Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].grid(alpha=0.25)
+    axes[0].legend()
+
+    if "accuracy" in history.history and "val_accuracy" in history.history:
+        tr_acc = maybe_smooth(history.history["accuracy"])
+        va_acc = maybe_smooth(history.history["val_accuracy"])
+        axes[1].plot(epochs, tr_acc, label="train", linewidth=2)
+        axes[1].plot(epochs, va_acc, label="val", linewidth=2)
+        axes[1].set_title(f"{title_prefix} - Accuracy")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Accuracy")
+        axes[1].grid(alpha=0.25)
+        axes[1].legend()
+    else:
+        axes[1].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+plot_history(history_mlp, "MLP", smooth=0.15)
+plot_history(history_ct, "CNN-Transformer", smooth=0.15)
+
+
+CELL 21:
+# NDVI (Arkansas) + cartes de classification — style notebook California (Step5)
+# Prérequis : exécuter tout le notebook jusqu'ici (ou « Run All Above ») : données + MLP + MCTNet.
+# Ne pas lancer cette cellule seule sur un kernel vide — sinon variables X_train, y_pred, etc. absentes.
+# Les cartes utilisent une grille carrée à partir des pixels de validation (ordre du split, pas la géographie),
+# sauf si vous exportez des GeoTIFF alignés comme en California (voir commentaire en fin de cellule).
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from pathlib import Path
+
+_REQUIRED = (
+    "PROJECT_ROOT",
+    "X_train",
+    "X_val",
+    "y_train",
+    "y_val",
+    "y_pred",
+    "y_pred_ct",
+    "n_classes",
+)
+_missing = [n for n in _REQUIRED if n not in globals()]
+if _missing:
+    raise RuntimeError(
+        "Variables absentes du noyau : "
+        + ", ".join(_missing)
+        + ". Exécute d'abord « Run All Above » sur cette cellule, ou rejoue au minimum : "
+        "PROJECT_ROOT → données (sections 1 ou 2) → entraînement MLP → entraînement MCTNet. "
+        "Cette cellule ne peut pas être exécutée en premier (kernel vide / In [1])."
+    )
+
+# --- NDVI (N, T) depuis X : canal NDVI si présent, sinon B4/B8 avec échelle réflectance ---
+
+
+def _ndvi_stack(X: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float64)
+    if X.shape[-1] >= 11 and globals().get("ADD_SPECTRAL_INDICES", False):
+        return np.clip(X[..., 10], -1.0, 1.0)
+    b4 = X[..., 2]
+    b8 = X[..., 3]
+    r4 = np.where(b4 > 1.5, b4 / 10000.0, np.clip(b4, 0.0, 1.0))
+    r8 = np.where(b8 > 1.5, b8 / 10000.0, np.clip(b8, 0.0, 1.0))
+    d = r8 + r4
+    out = np.zeros_like(r8)
+    m = d > 1e-6
+    out[m] = (r8[m] - r4[m]) / d[m]
+    return np.clip(out, -1.0, 1.0)
+
+
+def _class_names():
+    if globals().get("USE_PAPER_5_CLASSES", False) and "PAPER_LABELS" in globals():
+        return {i: PAPER_LABELS[i] for i in range(len(PAPER_LABELS))}
+    return {i: str(i) for i in range(int(n_classes))}
+
+
+# 1) Courbe NDVI moyenne par classe (même esprit que "(b) California")
+X_all = np.concatenate([X_train, X_val], axis=0)
+y_all = np.concatenate([y_train, y_val], axis=0)
+ndvi_all = _ndvi_stack(X_all)
+T = ndvi_all.shape[1]
+time_axis = np.linspace(10.0, 360.0, T)
+crop_names = _class_names()
+
+# Couleurs distinctes (5 classes papier Arkansas ; extensible)
+_base_colors = ["#EAB308", "#2563EB", "#16A34A", "#DC2626", "#78716C", "#8c564b", "#9467bd", "#1f77b4"]
+
+fig_ndvi, ax = plt.subplots(figsize=(10, 5))
+for c in range(int(n_classes)):
+    mask = y_all == c
+    if not np.any(mask):
+        continue
+    mean_ndvi = np.nanmean(ndvi_all[mask], axis=0)
+    mean_ndvi = np.nan_to_num(mean_ndvi, nan=0.0)
+    color = _base_colors[c % len(_base_colors)]
+    ax.plot(
+        time_axis,
+        mean_ndvi,
+        marker="o",
+        markersize=4,
+        linestyle="-",
+        linewidth=1.5,
+        color=color,
+        label=crop_names.get(c, str(c)),
+    )
+
+ax.set_title("(b) Arkansas — NDVI moyen par classe", fontsize=12)
+ax.set_xlabel("Jour de l'année (proxy 10–360 sur la série temporelle)", fontsize=12)
+ax.set_ylabel("Mean NDVI Value", fontsize=12)
+ax.grid(True, linestyle="-", alpha=0.6)
+ax.set_ylim(0.0, 1.0)
+ax.set_xlim(0, 370)
+ax.set_xticks(np.arange(10, 370, 50))
+ax.legend(loc="upper left", ncol=2, fontsize=10)
+plt.tight_layout()
+_out_ndvi = Path(PROJECT_ROOT) / "NDVI_timeseries_Arkansas.png"
+fig_ndvi.savefig(_out_ndvi, dpi=300, bbox_inches="tight")
+plt.show()
+print("Figure NDVI sauvegardée :", _out_ndvi)
+
+# 2) Cartes type California : grille à partir de X_val (premiers n = side^2 échantillons)
+n_val = int(len(y_val))
+side = int(np.sqrt(n_val))
+n2 = side * side
+if n2 < 16:
+    print("Pas assez de pixels validation pour une grille lisible (n2=", n2, ").")
+else:
+    gt = y_val[:n2].reshape(side, side)
+    pred_mlp = y_pred[:n2].reshape(side, side)
+    pred_mct = y_pred_ct[:n2].reshape(side, side)
+    err_mlp = np.where(pred_mlp == gt, 1, 0).astype(np.float32)
+    err_mct = np.where(pred_mct == gt, 1, 0).astype(np.float32)
+    ndvi_mean = np.nanmean(_ndvi_stack(X_val[:n2]), axis=1).reshape(side, side)
+
+    nc = int(n_classes)
+    colors = (_base_colors[:nc] if nc <= len(_base_colors) else [plt.cm.tab10(i / max(nc - 1, 1)) for i in range(nc)])
+    cmap_crops = mcolors.ListedColormap(colors)
+    cmap_err = mcolors.ListedColormap(["black", "white"])
+
+    fig_m, axes = plt.subplots(1, 5, figsize=(22, 4.5))
+    axes[0].imshow(np.clip(ndvi_mean, 0, 1), cmap="YlGn", vmin=0, vmax=1)
+    axes[0].set_title("NDVI moyen (saison)", fontsize=12)
+    axes[0].axis("off")
+
+    axes[1].imshow(gt, cmap=cmap_crops, vmin=0, vmax=nc - 1)
+    axes[1].set_title("(a1) Ground Truth (val)", fontsize=12)
+    axes[1].axis("off")
+
+    axes[2].imshow(err_mlp, cmap=cmap_err, vmin=0, vmax=1)
+    axes[2].set_title("(a2) Erreurs MLP (baseline)", fontsize=12)
+    axes[2].axis("off")
+
+    axes[3].imshow(pred_mct, cmap=cmap_crops, vmin=0, vmax=nc - 1)
+    axes[3].set_title("(a3) MCTNet Prediction", fontsize=12)
+    axes[3].axis("off")
+
+    axes[4].imshow(err_mct, cmap=cmap_err, vmin=0, vmax=1)
+    axes[4].set_title("(a4) MCTNet Errors", fontsize=12)
+    axes[4].axis("off")
+
+    plt.suptitle("Arkansas — cartes sur grille validation (non géoréférencée)", fontsize=11, y=1.02)
+    plt.tight_layout()
+    _out_maps = Path(PROJECT_ROOT) / "Classification_Maps_Arkansas.png"
+    fig_m.savefig(_out_maps, dpi=300, bbox_inches="tight")
+    plt.show()
+    print("Figure cartes sauvegardée :", _out_maps)
+
+# Pour reproduire exactement le pipeline California (carte ROI GeoTIFF + scaler + raster S2),
+# exportez des fichiers du type dataset/Arkansas_S2_stack.tif et labels alignés, puis adaptez
+# la lecture rasterio comme dans california/Step5_Model_Implementation_MCTNet.ipynb.
+
+
+CELL 23:
+import sys
+sys.path.append("C:/Users/pc/Desktop/partie2")  # <-- On indique le dossier du projet
+import pandas as pd
+from mctnet_model import build_mctnet
+
+# 1. On charge les supers données que l'on vient d'extraire depuis Earth Engine
+df_cov = pd.read_csv("C:/Users/pc/Desktop/partie2/dataset/covariables_environnementales.csv")
+
+df_cov = df_cov.sort_values("id").reset_index(drop=True)
+
+# 2. On sélectionne les 7 colonnes statiques environnementales 
+X_static_all = df_cov[['elevation', 'slope', 'aspect', 'clay', 'sand', 'silt', 'ph']].values
+
+# 3. On applique la MÊME séparation (Train/Validation) que vos images Sentinel-2
+from sklearn.model_selection import train_test_split
+_, _, X_static_train, X_static_val = train_test_split(
+    X, X_static_all, test_size=VAL_FRACTION, random_state=SEED, stratify=y
+)
+
+# 4. On construit le fameux MCTNet avec sa 2ème branche (les n_static_features)
+print("🏗️ Création du VRAI Modèle Hybride de la Partie 2 ...")
+model_final = build_mctnet(
+    n_timesteps=X_train.shape[1], 
+    n_channels=X_train.shape[2], 
+    n_classes=n_classes, 
+    n_static_features=7  # Nos 7 merveilles géospatiales !
+)
+
+model_final.compile(
+    optimizer="adam", 
+    loss="sparse_categorical_crossentropy", 
+    metrics=["accuracy"]
+)
+
+# 5. On lance l'entraînement de la fusion d'informations !
+print("🚀 Début du véritable entraînement fusionné !!! (Cela va prendre du temps...)")
+history = model_final.fit(
+    x=[X_train, X_static_train],     # C'est LA clé : liste contenant Images Temporelles ET le Vecteur Statique
+    y=y_train,
+    validation_data=([X_val, X_static_val], y_val),
+    epochs=30, 
+    batch_size=BATCH_SIZE
+)
+
+
+CELL 24:
+from sklearn.metrics import accuracy_score, cohen_kappa_score, f1_score
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import numpy as np
+from mctnet_model import build_mctnet
+
+# ============ LA MISE À L'ÉCHELLE (NORMALISATION) ============
+scaler_clim = StandardScaler()
+X_clim_static_scaled = scaler_clim.fit_transform(df_cov[['temp_max', 'temp_min', 'precip_sum']].values)
+X_clim_all = np.repeat(X_clim_static_scaled[:, np.newaxis, :], X_train.shape[1], axis=1)
+
+scaler_static = StandardScaler()
+X_static_all = scaler_static.fit_transform(df_cov[['elevation', 'slope', 'aspect', 'clay', 'sand', 'silt', 'ph']].values)
+# =============================================================
+
+from sklearn.model_selection import train_test_split
+_, _, X_clim_train, X_clim_val = train_test_split(
+    X, X_clim_all, test_size=VAL_FRACTION, random_state=SEED, stratify=y
+)
+_, _, X_static_train, X_static_val = train_test_split(
+    X, X_static_all, test_size=VAL_FRACTION, random_state=SEED, stratify=y
+)
+
+configs = [
+    {"name": "1. S2 original", "use_clim": False, "use_static": None},
+    {"name": "2. S2 + Climat", "use_clim": True, "use_static": None},
+    {"name": "3. S2 + Sol", "use_clim": False, "use_static": [3, 4, 5, 6]},
+    {"name": "4. S2 + Topographie", "use_clim": False, "use_static": [0, 1, 2]},
+    {"name": "5. S2 + Fusion Totale", "use_clim": True, "use_static": [0, 1, 2, 3, 4, 5, 6]}
+]
+
+real_results = {}
+print("🚀 DÉMARRAGE DE L'ÉTUDE D'ABLATION NORMALISÉE (5 Entraînements)...")
+for config in configs:
+    print(f"\n--- Évaluation: {config['name']} ---")
+    
+    X_train_current = X_train.copy()
+    X_val_current = X_val.copy()
+    
+    if config["use_clim"]:
+        X_train_current = np.concatenate([X_train_current, X_clim_train], axis=-1)
+        X_val_current = np.concatenate([X_val_current, X_clim_val], axis=-1)
+        
+    n_channels_current = X_train_current.shape[2]
+    
+    n_static = None
+    if config["use_static"] is not None:
+        idx = config["use_static"]
+        n_static = len(idx)
+        X_static_train_subset = X_static_train[:, idx]
+        X_static_val_subset = X_static_val[:, idx]
+        train_inputs = [X_train_current, X_static_train_subset]
+        val_inputs = [X_val_current, X_static_val_subset]
+    else:
+        train_inputs = [X_train_current]
+        val_inputs = [X_val_current]
+
+    model_ablation = build_mctnet(
+        n_timesteps=X_train.shape[1], 
+        n_channels=n_channels_current, 
+        n_classes=n_classes, 
+        n_static_features=n_static
+    )
+    model_ablation.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    
+    # 10 epochs c'est parfait pour comparer finement les apprentissages :
+    model_ablation.fit(
+        train_inputs, y_train, 
+        validation_data=(val_inputs, y_val), 
+        epochs=10, batch_size=64, verbose=0
+    )
+    
+    y_pred_prob = model_ablation.predict(val_inputs, verbose=0)
+    y_pred = np.argmax(y_pred_prob, axis=-1)
+    
+    real_results[config['name']] = {
+        "OA (Accuracy)": accuracy_score(y_val, y_pred),
+        "Kappa": cohen_kappa_score(y_val, y_pred),
+        "F1 (Macro)": f1_score(y_val, y_pred, average="macro")
+    }
+    print(f"✔️ Effectué !")
+
+df_ablation = pd.DataFrame(real_results).T
+print("\n=== RÉSULTATS VÉRITABLES DE L'ÉTUDE D'ABLATION (CORRIGÉE) ===")
+print(df_ablation.round(4))
+
+
+CELL 25:
+from sklearn.metrics import accuracy_score, cohen_kappa_score, f1_score, ConfusionMatrixDisplay, classification_report
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from mctnet_model import build_mctnet
+
+# ============== NORMALISATION ==============
+scaler_clim = StandardScaler()
+X_clim_static_scaled = scaler_clim.fit_transform(df_cov[['temp_max', 'temp_min', 'precip_sum']].values)
+X_clim_all = np.repeat(X_clim_static_scaled[:, np.newaxis, :], X_train.shape[1], axis=1)
+
+scaler_static = StandardScaler()
+X_static_all = scaler_static.fit_transform(df_cov[['elevation', 'slope', 'aspect', 'clay', 'sand', 'silt', 'ph']].values)
+
+from sklearn.model_selection import train_test_split
+_, _, X_clim_train, X_clim_val = train_test_split(X, X_clim_all, test_size=VAL_FRACTION, random_state=SEED, stratify=y)
+_, _, X_static_train, X_static_val = train_test_split(X, X_static_all, test_size=VAL_FRACTION, random_state=SEED, stratify=y)
+# ==========================================
+
+configs = [
+    {"name": "1. S2 original", "use_clim": False, "use_static": None},
+    {"name": "2. S2 + Climat", "use_clim": True, "use_static": None},
+    {"name": "3. S2 + Sol", "use_clim": False, "use_static": [3, 4, 5, 6]},
+    {"name": "4. S2 + Topographie", "use_clim": False, "use_static": [0, 1, 2]},
+    {"name": "5. S2 + Fusion Totale", "use_clim": True, "use_static": [0, 1, 2, 3, 4, 5, 6]}
+]
+
+real_results = {}
+
+print("🚀 DÉMARRAGE DE L'ÉTUDE D'ABLATION COMPLÈTE (5 MODÈLES + GRAPHES EN SÉRIE)...")
+
+for config in configs:
+    print(f"\n=======================================================")
+    print(f"       ÉVALUATION EN COURS : {config['name']}          ")
+    print(f"=======================================================")
+    
+    # 1. Préparation spécifique
+    X_train_current = X_train.copy()
+    X_val_current = X_val.copy()
+    if config["use_clim"]:
+        X_train_current = np.concatenate([X_train_current, X_clim_train], axis=-1)
+        X_val_current = np.concatenate([X_val_current, X_clim_val], axis=-1)
+        
+    n_static = None
+    if config["use_static"] is not None:
+        idx = config["use_static"]
+        n_static = len(idx)
+        train_inputs = [X_train_current, X_static_train[:, idx]]
+        val_inputs = [X_val_current, X_static_val[:, idx]]
+    else:
+        train_inputs = [X_train_current]
+        val_inputs = [X_val_current]
+
+    # 2. Compilation et Entraînement
+    model_ablation = build_mctnet(
+        n_timesteps=X_train.shape[1], n_channels=X_train_current.shape[2], 
+        n_classes=n_classes, n_static_features=n_static
+    )
+    model_ablation.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    
+    history = model_ablation.fit(
+        train_inputs, y_train, 
+        validation_data=(val_inputs, y_val), 
+        epochs=15, batch_size=64, verbose=0  # On le fait monter à 15 Epochs pour obtenir de vraies belles courbes
+    )
+    
+    # 3. Prédictions
+    y_pred_prob = model_ablation.predict(val_inputs, verbose=0)
+    y_pred = np.argmax(y_pred_prob, axis=-1)
+    
+    # ================== GÉNÉRATION DES GRAPHIQUES ET RAPPORTS ==================
+    # A. Courbes d'apprentissage
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    ax1.plot(history.history['accuracy'], label='Train Accuracy', color='green')
+    ax1.plot(history.history['val_accuracy'], label='Validation Accuracy', color='darkorange', linestyle='--')
+    ax1.set_title(f"Ablation : {config['name']}\nÉvolution de la Précision")
+    ax1.set_xlabel('Époques (Epochs)')
+    ax1.set_ylabel('Précision (Accuracy)')
+    ax1.legend()
+    ax1.grid(True)
+
+    ax2.plot(history.history['loss'], label='Train Loss', color='red')
+    ax2.plot(history.history['val_loss'], label='Validation Loss', color='darkblue', linestyle='--')
+    ax2.set_title(f"Ablation : {config['name']}\nÉvolution de la Perte")
+    ax2.set_xlabel('Époques (Epochs)')
+    ax2.set_ylabel('Perte (Cross-Entropy)')
+    ax2.legend()
+    ax2.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+
+    # B. Matrice de Confusion
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ConfusionMatrixDisplay.from_predictions(
+        y_val, y_pred, display_labels=PAPER_LABELS, cmap='Blues', ax=ax, colorbar=False
+    )
+    plt.title(f"Matrice de Confusion\n({config['name']})")
+    plt.ylabel('Classes Réelles CDL')
+    plt.xlabel('Prédictions MCTNet')
+    plt.show() 
+    
+    # C. Rapport de classification direct de Scikit-Learn
+    print(f"\n--- RAPPORT DE CLASSIFICATION ({config['name']}) ---")
+    print(classification_report(y_val, y_pred, target_names=PAPER_LABELS))
+    # =========================================================================
+    
+    # 4. Enregistrement des Métriques pour le grand final
+    real_results[config['name']] = {
+        "OA (Accuracy)": accuracy_score(y_val, y_pred),
+        "Kappa": cohen_kappa_score(y_val, y_pred),
+        "F1 (Macro)": f1_score(y_val, y_pred, average="macro")
+    }
+
+# GRAND TABLEAU RÉCAPITULATIF À LA FIN DU NOTEBOOK
+df_ablation = pd.DataFrame(real_results).T
+print("\n=================================================================")
+print("=== RÉSULTATS VÉRITABLES DE L'ÉTUDE D'ABLATION (NORMALISÉS) ===")
+print("=================================================================")
+print(df_ablation.round(4))
+

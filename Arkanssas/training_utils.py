@@ -11,10 +11,16 @@ __all__ = [
     "ScalarEarlyStopping",
     "sparse_categorical_crossentropy_label_smoothing",
     "sparse_categorical_focal_loss",
+    "SparseCategoricalFocalLoss",
+    "MacroF1Score",
+    "CosineAnnealingLearningRate",
+    "augment_timeseries",
+    "make_augment_tf_wrapper",
 ]
 
 import numpy as np
 import tensorflow as tf
+from tensorflow import keras
 
 
 def oversample_balanced(
@@ -187,3 +193,134 @@ def sparse_categorical_focal_loss(gamma: float = 2.0, alpha: float | None = None
         return tf.reduce_mean(mod * ce)
 
     return loss
+
+
+class SparseCategoricalFocalLoss(keras.losses.Loss):
+    """Focal loss sparse (y entier) ; alpha scalaire optionnel (pondération globale)."""
+
+    def __init__(self, gamma: float = 2.0, alpha: float | None = None, name="sparse_categorical_focal", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.gamma = float(gamma)
+        self.alpha = alpha
+
+    def call(self, y_true, y_pred):
+        return sparse_categorical_focal_loss(self.gamma, self.alpha)(y_true, y_pred)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"gamma": self.gamma, "alpha": self.alpha})
+        return cfg
+
+
+class MacroF1Score(keras.metrics.Metric):
+    """F1-macro : accumulation TP / FP / FN par classe sur la batch."""
+
+    def __init__(self, n_classes: int, name: str = "macro_f1", dtype=None, **kwargs):
+        super().__init__(name=name, dtype=dtype, **kwargs)
+        self.n_classes = int(n_classes)
+        self.tp = self.add_weight(shape=(self.n_classes,), name="tp", initializer="zeros")
+        self.fp = self.add_weight(shape=(self.n_classes,), name="fp", initializer="zeros")
+        self.fn = self.add_weight(shape=(self.n_classes,), name="fn", initializer="zeros")
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        del sample_weight
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+        pred = tf.cast(tf.argmax(y_pred, axis=-1), tf.int32)
+        depth = self.n_classes
+        y_oh = tf.one_hot(y_true, depth=depth, dtype=tf.float32)
+        p_oh = tf.one_hot(pred, depth=depth, dtype=tf.float32)
+        tp = tf.reduce_sum(y_oh * p_oh, axis=0)
+        fp = tf.reduce_sum((1.0 - y_oh) * p_oh, axis=0)
+        fn = tf.reduce_sum(y_oh * (1.0 - p_oh), axis=0)
+        self.tp.assign_add(tp)
+        self.fp.assign_add(fp)
+        self.fn.assign_add(fn)
+
+    def result(self):
+        eps = tf.constant(1e-7, dtype=self.tp.dtype)
+        prec = self.tp / (self.tp + self.fp + eps)
+        rec = self.tp / (self.tp + self.fn + eps)
+        f1 = 2.0 * prec * rec / (prec + rec + eps)
+        return tf.reduce_mean(f1)
+
+    def reset_state(self):
+        for v in self.variables:
+            v.assign(tf.zeros_like(v))
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"n_classes": self.n_classes})
+        return cfg
+
+
+class CosineAnnealingLearningRate(keras.callbacks.Callback):
+    """lr(epoch) = lr_min + 0.5*(lr_max - lr_min)*(1 + cos(pi * epoch / T_max))."""
+
+    def __init__(
+        self,
+        lr_max: float = 1e-3,
+        lr_min: float = 1e-6,
+        t_max: int = 100,
+        verbose: int = 0,
+    ):
+        super().__init__()
+        self.lr_max = float(lr_max)
+        self.lr_min = float(lr_min)
+        self.t_max = max(int(t_max), 1)
+        self.verbose = int(verbose)
+
+    def on_epoch_begin(self, epoch, logs=None):
+        lr = self.lr_min + 0.5 * (self.lr_max - self.lr_min) * (
+            1.0 + float(np.cos(np.pi * float(epoch) / float(self.t_max)))
+        )
+        self.model.optimizer.learning_rate.assign(lr)
+        if self.verbose and epoch % 10 == 0:
+            print(f"Epoch {epoch + 1}: lr={lr:.2e}")
+
+
+def augment_timeseries(
+    X: np.ndarray,
+    mask: np.ndarray | None,
+    *,
+    p: float = 0.3,
+    dropout_frac_min: float = 0.1,
+    dropout_frac_max: float = 0.2,
+    noise_std: float = 0.005,
+    seed: int | None = None,
+) -> np.ndarray:
+    """
+    Augmentation train uniquement : dropout temporel aléatoire (10–20 % des pas)
+    mis à 0 + bruit gaussien sur bandes valides. `mask` n'est pas modifié (référence originale).
+    """
+    rng = np.random.default_rng(seed)
+    X = np.asarray(X, dtype=np.float32).copy()
+    n, t, c = X.shape
+    for i in range(n):
+        if rng.random() > p:
+            continue
+        frac = rng.uniform(dropout_frac_min, dropout_frac_max)
+        k = max(1, int(round(t * frac)))
+        drop_idx = rng.choice(t, size=k, replace=False)
+        X[i, drop_idx, :] = 0.0
+        noise = rng.normal(0.0, noise_std, size=(t, c)).astype(np.float32)
+        valid = np.ones(t, dtype=bool) if mask is None else mask[i].astype(bool)
+        for tt in range(t):
+            if valid[tt]:
+                X[i, tt, :] = X[i, tt, :] + noise[tt]
+    return X
+
+
+def make_augment_tf_wrapper(p: float = 0.3, seed: int = 42):
+    """Retourne une fonction pour `tf.data.Dataset.map` (train seulement)."""
+
+    def _aug(x, y):
+        def _numpy_aug(xx):
+            xx = np.asarray(xx, dtype=np.float32)
+            m = np.any(np.abs(xx) > 1e-12, axis=-1)
+            return augment_timeseries(xx[None, ...], m[None, ...], p=p, seed=seed)[0]
+
+        x_aug = tf.numpy_function(_numpy_aug, [x], tf.float32)
+        x_aug.set_shape(x.shape)
+        return x_aug, y
+
+    return _aug

@@ -46,6 +46,12 @@ class ECA1D(layers.Layer):
         return x * y[:, None, :]
 
 
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"kernel_size": self.kernel_size, "kernel_regularizer": self.kernel_regularizer})
+        return cfg
+
+
 class ALPE(layers.Layer):
     """
     Attention-based Learnable Positional Encoding (paper):
@@ -82,6 +88,16 @@ class ALPE(layers.Layer):
         )
         super().build(input_shape)
 
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "num_timesteps": self.num_timesteps,
+            "d_model": self.d_model,
+            "conv_kernel": self.conv_kernel,
+            "kernel_regularizer": self.kernel_regularizer,
+        })
+        return cfg
+
     def call(self, mask_bool, **kwargs):
         # mask_bool: (B, T) True = valid
         # PE must be built with TF ops inside call() so Keras/tf.function tracing does not
@@ -114,6 +130,11 @@ class MaskedGlobalAveragePooling1D(layers.Layer):
         super().__init__(**kwargs)
         self.eps = float(eps)
 
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"eps": self.eps})
+        return cfg
+
     def call(self, inputs, **kwargs):
         x, mask = inputs
         mask_f = tf.cast(mask, x.dtype)[..., None]
@@ -128,6 +149,11 @@ class MaskedGlobalMaxPooling1D(layers.Layer):
     def __init__(self, fill_value: float = -1e9, **kwargs):
         super().__init__(**kwargs)
         self.fill_value = float(fill_value)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"fill_value": self.fill_value})
+        return cfg
 
     def call(self, inputs, **kwargs):
         x, mask = inputs
@@ -160,7 +186,12 @@ class BuildSelfAttentionMask(layers.Layer):
 
     def call(self, mask_bool, **kwargs):
         mask_bool = tf.cast(mask_bool, tf.bool)
-        return tf.logical_and(mask_bool[:, :, None], mask_bool[:, None, :])
+        # Si une requête est invalide et n'a d'attention vers aucune clé, MHA génère des NaNs (softmax de -inf).
+        # On autorise donc TOUTES les requêtes (même invalides) à s'attendre aux clés valides.
+        # EnsureOneValidTimeStep garantit qu'il y a au moins 1 clé valide, donc on n'aura jamais de ligne 100% False.
+        b = tf.shape(mask_bool)[0]
+        t = tf.shape(mask_bool)[1]
+        return tf.broadcast_to(mask_bool[:, None, :], [b, t, t])
 
     def compute_output_shape(self, input_shape):
         return (input_shape[0], input_shape[1], input_shape[1])
@@ -168,8 +199,10 @@ class BuildSelfAttentionMask(layers.Layer):
 
 class CTFusion(layers.Layer):
     """
-    One CTFusion stage: local CNN branch (with ECA) + global Transformer branch
-    on (LayerNorm(x + ALPE)); fused by sum + LayerNorm.
+    One CTFusion stage: local CNN branch (with ECA) + global Transformer branch.
+    Paper Fig. 3: fusion by **concatenation** + linear projection + LayerNorm (not Add).
+    Paper §2.3.1: ALPE mask encoding is used **only in the first stage** — `alpe` is passed
+    from outside for stage 0; later stages receive no positional add (pre-norm on `x` only).
     """
 
     def __init__(
@@ -182,6 +215,8 @@ class CTFusion(layers.Layer):
         conv_kernel: int = 3,
         kernel_regularizer=None,
         name_prefix: str = "ct",
+        *,
+        use_alpe: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -193,18 +228,12 @@ class CTFusion(layers.Layer):
         self.conv_kernel = int(conv_kernel)
         self.kernel_regularizer = kernel_regularizer
         self.name_prefix = name_prefix
+        self.use_alpe = bool(use_alpe)
         self._key_dim = max(1, self.d_model // self.num_heads)
 
     def build(self, input_shape):
         p = self.name_prefix
         kr = self.kernel_regularizer
-        self.alpe = ALPE(
-            self.num_timesteps,
-            self.d_model,
-            conv_kernel=self.conv_kernel,
-            kernel_regularizer=kr,
-            name=f"{p}_alpe",
-        )
         self.cnn_bn1 = layers.BatchNormalization(name=f"{p}_cnn_bn1")
         self.cnn_conv1 = layers.Conv1D(
             self.d_model,
@@ -240,10 +269,11 @@ class CTFusion(layers.Layer):
             dropout=self.dropout,
             name=f"{p}_mha",
         )
+        self.attn_dropout = layers.Dropout(self.dropout, name=f"{p}_attn_dropout")
         self.ln_attn = layers.LayerNormalization(epsilon=1e-6, name=f"{p}_ln_attn")
         self.ff1 = layers.Dense(
             self.ff_dim,
-            activation="gelu",
+            activation="relu",
             kernel_regularizer=kr,
             name=f"{p}_ff1",
         )
@@ -253,16 +283,43 @@ class CTFusion(layers.Layer):
         self.ln_fuse = layers.LayerNormalization(epsilon=1e-6, name=f"{p}_ln_fuse")
         self.relu = layers.Activation("relu", name=f"{p}_relu")
         self.add_cnn_res = layers.Add(name=f"{p}_cnn_res")
-        self.add_pe = layers.Add(name=f"{p}_add_pe")
+        if self.use_alpe:
+            self.add_pe = layers.Add(name=f"{p}_add_pe")
         self.add_attn_res = layers.Add(name=f"{p}_attn_res")
         self.add_ff_res = layers.Add(name=f"{p}_ff_res")
-        self.add_fuse = layers.Add(name=f"{p}_fuse")
+        self.concat_fuse = layers.Concatenate(axis=-1, name=f"{p}_concat_fuse")
+        self.fuse_proj = layers.Conv1D(
+            self.d_model,
+            1,
+            padding="same",
+            use_bias=False,
+            kernel_regularizer=kr,
+            name=f"{p}_fuse_proj",
+        )
         super().build(input_shape)
 
-    def call(self, inputs, training=None):
-        x, mask_bool, attn_mask = inputs
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update(
+            {
+                "d_model": self.d_model,
+                "num_heads": self.num_heads,
+                "ff_dim": self.ff_dim,
+                "dropout": self.dropout,
+                "num_timesteps": self.num_timesteps,
+                "conv_kernel": self.conv_kernel,
+                "name_prefix": self.name_prefix,
+                "use_alpe": self.use_alpe,
+            }
+        )
+        return cfg
 
-        alpe = self.alpe(mask_bool)
+    def call(self, inputs, training=None):
+        if self.use_alpe:
+            x, mask_bool, attn_mask, alpe = inputs
+        else:
+            x, mask_bool, attn_mask = inputs
+            alpe = None
 
         # Local CNN branch (residual + ECA after first conv stack, paper-aligned kernel 3)
         res = x
@@ -276,16 +333,26 @@ class CTFusion(layers.Layer):
         h = self.cnn_eca2([h, mask_bool])
         cnn_branch = self.add_cnn_res([res, h])
 
-        # Global Transformer branch (pre-norm on x + ALPE)
-        xt = self.ln_in(self.add_pe([x, alpe]))
+        # Global Transformer branch: stage 0 uses x + ALPE (paper); deeper stages — no PE add.
+        if alpe is not None:
+            xt = self.ln_in(self.add_pe([x, alpe]))
+        else:
+            xt = self.ln_in(x)
         xa = self.mha(xt, xt, attention_mask=attn_mask, training=training)
+        xa = self.attn_dropout(xa, training=training)
         xt2 = self.ln_attn(self.add_attn_res([xt, xa]))
         xf = self.ff1(xt2)
         xf = self.ff_drop(xf, training=training)
         xf = self.ff2(xf)
         trans_branch = self.ln_ff(self.add_ff_res([xt2, xf]))
 
-        return self.ln_fuse(self.add_fuse([cnn_branch, trans_branch]))
+        fused = self.concat_fuse([cnn_branch, trans_branch])
+        fused = self.fuse_proj(fused)
+        out = self.ln_fuse(fused)
+        
+        # Bloque strictement la propagation des NaNs ou du bruit sur les timesteps invalides
+        mask_f = tf.cast(mask_bool, out.dtype)[..., None]
+        return out * mask_f
 
 
 def build_mctnet(
@@ -302,7 +369,7 @@ def build_mctnet(
     dropout: float = 0.1,
     missing_value: float | None = 0.0,
     add_ndvi_if_missing: bool = True,
-    light: bool = True,
+    light: bool = False,
     conv_kernel: int = 3,
     l2: float | None = None,
 ) -> keras.Model:
@@ -315,6 +382,9 @@ def build_mctnet(
     d_model must be even (sinusoidal PE). Prefer d_model divisible by num_heads for
     clean head splits (e.g. d_model=60, num_heads=5).
     Optional `l2` adds kernel L2 regularization on conv/dense layers (reduces overfitting).
+
+    NDVI doublons : passer ``add_ndvi_if_missing=False`` quand les données ont déjà 11 canaux
+    après ``load_geotiff_stack_paper_split``.
     """
     if d_model % 2 != 0:
         raise ValueError(f"d_model must be even for sinusoidal ALPE, got {d_model}")
@@ -385,7 +455,22 @@ def build_mctnet(
     x = layers.BatchNormalization(name="stem_bn")(x)
     x = layers.Activation("relu", name="stem_relu")(x)
 
+    # Single shared ALPE (paper §2.3.1: mask-based PE only in the first stage).
+    shared_alpe = ALPE(
+        n_timesteps,
+        d_model,
+        conv_kernel=conv_kernel,
+        kernel_regularizer=kernel_reg,
+        name="shared_alpe",
+    )(mask_bool)
+
     for s in range(n_stage):
+        use_alpe = s == 0
+        fusion_in = (
+            [x, mask_bool, attn_mask, shared_alpe]
+            if use_alpe
+            else [x, mask_bool, attn_mask]
+        )
         x = CTFusion(
             d_model=d_model,
             num_heads=num_heads,
@@ -395,21 +480,33 @@ def build_mctnet(
             conv_kernel=conv_kernel,
             kernel_regularizer=kernel_reg,
             name_prefix=f"stage{s}",
+            use_alpe=use_alpe,
             name=f"ct_fusion_{s}",
-        )([x, mask_bool, attn_mask])
+        )(fusion_in)
 
-    x = MaskedGlobalMaxPooling1D(name="masked_gmp")([x, mask_bool])
+    x = MaskedGlobalAveragePooling1D(name="masked_gap")([x, mask_bool])
     
     if n_static_features is not None and n_static_features > 0:
         inp_static = keras.Input(shape=(n_static_features,), dtype=tf.float32, name="x_static")
         model_inputs.append(inp_static)
-        
-        # Projection of static features
-        x_static = layers.Dense(d_model, activation="relu", kernel_regularizer=kernel_reg, name="static_dense1")(inp_static)
-        x_static = layers.BatchNormalization(name="static_bn")(x_static)
-        
-        # Concatenate temporal and static features
-        x = layers.Concatenate(axis=-1, name="concat_temporal_static")([x, x_static])
+        x_static = layers.Dense(d_model, kernel_regularizer=kernel_reg, name="static_dense1")(inp_static)
+        x_static = layers.BatchNormalization(name="static_bn1")(x_static)
+        x_static = layers.Activation("relu", name="static_relu1")(x_static)
+        x_static = layers.Dropout(dropout, name="static_drop")(x_static)
+        x_static = layers.Dense(d_model, kernel_regularizer=kernel_reg, name="static_dense2")(x_static)
+        x_static = layers.BatchNormalization(name="static_bn2")(x_static)
+        x_static = layers.Activation("relu", name="static_relu2")(x_static)
+
+        x_cat = layers.Concatenate(axis=-1, name="concat_temporal_static")([x, x_static])
+        gate = layers.Dense(
+            2 * d_model,
+            activation="sigmoid",
+            kernel_regularizer=kernel_reg,
+            name="fusion_gate",
+        )(x_cat)
+        gated = layers.Multiply(name="fusion_gate_mult")([x_cat, gate])
+        x = layers.Dense(d_model, kernel_regularizer=kernel_reg, activation="relu", name="fusion_proj")(gated)
+        x = layers.BatchNormalization(name="fusion_bn")(x)
 
     x = layers.Dropout(dropout, name="head_drop")(x)
     out = layers.Dense(

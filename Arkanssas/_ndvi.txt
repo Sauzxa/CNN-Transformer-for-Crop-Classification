@@ -1,0 +1,149 @@
+# NDVI (Arkansas) + cartes de classification — style notebook California (Step5)
+# Prérequis : exécuter tout le notebook jusqu'ici (ou « Run All Above ») : données + MLP + MCTNet.
+# Ne pas lancer cette cellule seule sur un kernel vide — sinon variables X_train, y_pred, etc. absentes.
+# Les cartes utilisent une grille carrée à partir des pixels de validation (ordre du split, pas la géographie),
+# sauf si vous exportez des GeoTIFF alignés comme en California (voir commentaire en fin de cellule).
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from pathlib import Path
+
+_REQUIRED = (
+    "PROJECT_ROOT",
+    "X_train",
+    "X_val",
+    "y_train",
+    "y_val",
+    "y_pred",
+    "y_pred_ct",
+    "n_classes",
+)
+_missing = [n for n in _REQUIRED if n not in globals()]
+if _missing:
+    raise RuntimeError(
+        "Variables absentes du noyau : "
+        + ", ".join(_missing)
+        + ". Exécute d'abord « Run All Above » sur cette cellule, ou rejoue au minimum : "
+        "PROJECT_ROOT → données (sections 1 ou 2) → entraînement MLP → entraînement MCTNet. "
+        "Cette cellule ne peut pas être exécutée en premier (kernel vide / In [1])."
+    )
+
+# --- NDVI (N, T) depuis X : canal NDVI si présent, sinon B4/B8 avec échelle réflectance ---
+
+
+def _ndvi_stack(X: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float64)
+    if X.shape[-1] >= 11 and globals().get("ADD_SPECTRAL_INDICES", False):
+        return np.clip(X[..., 10], -1.0, 1.0)
+    b4 = X[..., 2]
+    b8 = X[..., 3]
+    r4 = np.where(b4 > 1.5, b4 / 10000.0, np.clip(b4, 0.0, 1.0))
+    r8 = np.where(b8 > 1.5, b8 / 10000.0, np.clip(b8, 0.0, 1.0))
+    d = r8 + r4
+    out = np.zeros_like(r8)
+    m = d > 1e-6
+    out[m] = (r8[m] - r4[m]) / d[m]
+    return np.clip(out, -1.0, 1.0)
+
+
+def _class_names():
+    if globals().get("USE_PAPER_5_CLASSES", False) and "PAPER_LABELS" in globals():
+        return {i: PAPER_LABELS[i] for i in range(len(PAPER_LABELS))}
+    return {i: str(i) for i in range(int(n_classes))}
+
+
+# 1) Courbe NDVI moyenne par classe (même esprit que "(b) California")
+X_all = np.concatenate([X_train, X_val], axis=0)
+y_all = np.concatenate([y_train, y_val], axis=0)
+ndvi_all = _ndvi_stack(X_all)
+T = ndvi_all.shape[1]
+time_axis = np.linspace(10.0, 360.0, T)
+crop_names = _class_names()
+
+# Couleurs distinctes (5 classes papier Arkansas ; extensible)
+_base_colors = ["#EAB308", "#2563EB", "#16A34A", "#DC2626", "#78716C", "#8c564b", "#9467bd", "#1f77b4"]
+
+fig_ndvi, ax = plt.subplots(figsize=(10, 5))
+for c in range(int(n_classes)):
+    mask = y_all == c
+    if not np.any(mask):
+        continue
+    mean_ndvi = np.nanmean(ndvi_all[mask], axis=0)
+    mean_ndvi = np.nan_to_num(mean_ndvi, nan=0.0)
+    color = _base_colors[c % len(_base_colors)]
+    ax.plot(
+        time_axis,
+        mean_ndvi,
+        marker="o",
+        markersize=4,
+        linestyle="-",
+        linewidth=1.5,
+        color=color,
+        label=crop_names.get(c, str(c)),
+    )
+
+ax.set_title("(b) Arkansas — NDVI moyen par classe", fontsize=12)
+ax.set_xlabel("Jour de l'année (proxy 10–360 sur la série temporelle)", fontsize=12)
+ax.set_ylabel("Mean NDVI Value", fontsize=12)
+ax.grid(True, linestyle="-", alpha=0.6)
+ax.set_ylim(0.0, 1.0)
+ax.set_xlim(0, 370)
+ax.set_xticks(np.arange(10, 370, 50))
+ax.legend(loc="upper left", ncol=2, fontsize=10)
+plt.tight_layout()
+_out_ndvi = Path(PROJECT_ROOT) / "NDVI_timeseries_Arkansas.png"
+fig_ndvi.savefig(_out_ndvi, dpi=300, bbox_inches="tight")
+plt.show()
+print("Figure NDVI sauvegardée :", _out_ndvi)
+
+# 2) Cartes type California : grille à partir de X_val (premiers n = side^2 échantillons)
+n_val = int(len(y_val))
+side = int(np.sqrt(n_val))
+n2 = side * side
+if n2 < 16:
+    print("Pas assez de pixels validation pour une grille lisible (n2=", n2, ").")
+else:
+    gt = y_val[:n2].reshape(side, side)
+    pred_mlp = y_pred[:n2].reshape(side, side)
+    pred_mct = y_pred_ct[:n2].reshape(side, side)
+    err_mlp = np.where(pred_mlp == gt, 1, 0).astype(np.float32)
+    err_mct = np.where(pred_mct == gt, 1, 0).astype(np.float32)
+    ndvi_mean = np.nanmean(_ndvi_stack(X_val[:n2]), axis=1).reshape(side, side)
+
+    nc = int(n_classes)
+    colors = (_base_colors[:nc] if nc <= len(_base_colors) else [plt.cm.tab10(i / max(nc - 1, 1)) for i in range(nc)])
+    cmap_crops = mcolors.ListedColormap(colors)
+    cmap_err = mcolors.ListedColormap(["black", "white"])
+
+    fig_m, axes = plt.subplots(1, 5, figsize=(22, 4.5))
+    axes[0].imshow(np.clip(ndvi_mean, 0, 1), cmap="YlGn", vmin=0, vmax=1)
+    axes[0].set_title("NDVI moyen (saison)", fontsize=12)
+    axes[0].axis("off")
+
+    axes[1].imshow(gt, cmap=cmap_crops, vmin=0, vmax=nc - 1)
+    axes[1].set_title("(a1) Ground Truth (val)", fontsize=12)
+    axes[1].axis("off")
+
+    axes[2].imshow(err_mlp, cmap=cmap_err, vmin=0, vmax=1)
+    axes[2].set_title("(a2) Erreurs MLP (baseline)", fontsize=12)
+    axes[2].axis("off")
+
+    axes[3].imshow(pred_mct, cmap=cmap_crops, vmin=0, vmax=nc - 1)
+    axes[3].set_title("(a3) MCTNet Prediction", fontsize=12)
+    axes[3].axis("off")
+
+    axes[4].imshow(err_mct, cmap=cmap_err, vmin=0, vmax=1)
+    axes[4].set_title("(a4) MCTNet Errors", fontsize=12)
+    axes[4].axis("off")
+
+    plt.suptitle("Arkansas — cartes sur grille validation (non géoréférencée)", fontsize=11, y=1.02)
+    plt.tight_layout()
+    _out_maps = Path(PROJECT_ROOT) / "Classification_Maps_Arkansas.png"
+    fig_m.savefig(_out_maps, dpi=300, bbox_inches="tight")
+    plt.show()
+    print("Figure cartes sauvegardée :", _out_maps)
+
+# Pour reproduire exactement le pipeline California (carte ROI GeoTIFF + scaler + raster S2),
+# exportez des fichiers du type dataset/Arkansas_S2_stack.tif et labels alignés, puis adaptez
+# la lecture rasterio comme dans california/Step5_Model_Implementation_MCTNet.ipynb.

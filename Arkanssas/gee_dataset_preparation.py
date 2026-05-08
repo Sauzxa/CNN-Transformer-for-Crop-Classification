@@ -1,6 +1,8 @@
 import ee
 import pandas as pd
 from datetime import datetime, timedelta
+from pathlib import Path
+import argparse
 
 def init_gee():
     try:
@@ -78,29 +80,64 @@ if __name__ == "__main__":
     init_gee()
     
     print("Chargement des coordonnées depuis le CSV généré via la Solution 1...")
-    csv_path = "dataset/points_agricoles.csv"
+    ap = argparse.ArgumentParser(description="Exporte covariables environnementales pour une liste de points.")
+    ap.add_argument(
+        "--points-csv",
+        type=Path,
+        default=None,
+        help="CSV avec colonnes `id, lon, lat` (défaut: dataset/points_agricoles.csv).",
+    )
+    ap.add_argument(
+        "--out-csv",
+        type=Path,
+        default=None,
+        help="CSV de sortie (défaut: dataset/covariables_environnementales.csv).",
+    )
+    ap.add_argument("--start-date", type=str, default="2025-01-01")
+    ap.add_argument("--end-date", type=str, default="2025-12-31")
+    ap.add_argument("--chunk-size", type=int, default=4000)
+    args = ap.parse_args()
+
+    project_root = Path(__file__).resolve().parent
+    csv_path = args.points_csv or (project_root / "dataset" / "points_agricoles.csv")
+    out_csv = args.out_csv or (project_root / "dataset" / "covariables_environnementales.csv")
     try:
         df_points = pd.read_csv(csv_path)
     except FileNotFoundError:
         print(f"Erreur: {csv_path} introuvable. Exécutez export_coords.py d'abord!")
         exit(1)
+
+    required_cols = {"lon", "lat"}
+    missing = required_cols - set(df_points.columns)
+    if missing:
+        raise ValueError(f"Colonnes manquantes dans {csv_path}: {sorted(missing)}")
+
+    # IMPORTANT : l'alignement partie 1 ↔ partie 2 repose sur un identifiant stable.
+    # On réutilise la colonne `id` si elle existe, sinon on la crée.
+    if "id" not in df_points.columns:
+        df_points = df_points.reset_index(drop=True).copy()
+        df_points["id"] = df_points.index.astype(int)
+    else:
+        # normalisation type + ordre
+        df_points["id"] = df_points["id"].astype(int)
+        df_points = df_points.sort_values("id").reset_index(drop=True)
         
     features_list = []
     # Boucle sur VOS vraies données sans limite (ça va prendre environ 2 à 5 minutes pour 16 000 points)
     print("Création de la FeatureCollection Earth Engine complète...")
     for index, row in df_points.iterrows(): 
         geom = ee.Geometry.Point([row['lon'], row['lat']])
-        feature = ee.Feature(geom, {'id': index})
+        feature = ee.Feature(geom, {'id': int(row['id'])})
         features_list.append(feature)
         
     # GEE bloque les requêtes de plus de 5000 éléments avec getInfo(). On procède donc par "lots" (chunks).
     print("Découpage et extraction par lots de 4000 points (Patientez quelques minutes)...")
     
-    start_date = '2025-01-01'
-    end_date = '2025-12-31'
+    start_date = args.start_date
+    end_date = args.end_date
     
     data = []
-    chunk_size = 4000
+    chunk_size = int(args.chunk_size)
     
     for i in range(0, len(features_list), chunk_size):
         chunk = features_list[i : i + chunk_size]
@@ -116,10 +153,13 @@ if __name__ == "__main__":
             data.append(f['properties'])
         
     df = pd.DataFrame(data)
+    if "id" in df.columns:
+        df["id"] = df["id"].astype(int)
+        df = df.sort_values("id").reset_index(drop=True)
     print("Données extraites avec succès ! Aperçu :")
     print(df.head())
     
     # Sauvegarde au format CSV de vos variables
-    out_csv = "dataset/covariables_environnementales.csv"
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
     print(f"Vos covariables sont sauvées et prêtes pour l'ablation dans {out_csv} !")
