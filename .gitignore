@@ -21,3 +21,7 @@ Thumbs.db
 california/processed_data/
 california/runs/
 california/dataset/
+docs/
+REPORT_TASKS.md
+latex/
+.codex
