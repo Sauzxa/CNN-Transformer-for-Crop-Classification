@@ -7,7 +7,7 @@
 ![Google Earth Engine](https://img.shields.io/badge/Google%20Earth%20Engine-4285F4?style=for-the-badge&logo=googleearthengine&logoColor=white)
 ![Remote Sensing](https://img.shields.io/badge/Remote%20Sensing-Sentinel--1%20%2B%20Sentinel--2-16A34A?style=for-the-badge)
 
-This repository contains a full academic project around **MCTNet**, a lightweight hybrid **CNN + Transformer** architecture for crop classification using irregular satellite time series. The work starts by reproducing the original MCTNet baseline, then studies environmental covariates, and finally proposes **MCTNet-v2**, a multimodal extension combining Sentinel-2, Sentinel-1, soil, and topography.
+This repository contains a full academic project around **MCTNet**, a lightweight hybrid **CNN + Transformer** architecture for crop classification using irregular satellite time series. The work reproduces the original MCTNet baseline on **California**, transfers the same pipeline to **Arkansas**, studies environmental covariates in both settings, and proposes **MCTNet-v2**, a multimodal extension combining Sentinel-2, Sentinel-1, soil, and topography.
 
 ---
 
@@ -31,17 +31,20 @@ flowchart LR
     B --> C["Part 3<br/>MCTNet-v2 Multimodal Fusion"]
     C --> D["Results + Discussion"]
 
-    A -.-> A1["Sentinel-2<br/>36 x 10"]
+    A -.-> A1["California<br/>6 classes"]
+    A -.-> A2["Arkansas<br/>5 classes"]
     B -.-> B1["Climate<br/>Soil<br/>Topography"]
+    B -.-> B2["Regional comparison"]
     C -.-> C1["Sentinel-1<br/>12 x 3"]
+    C -.-> C2["Selective fusion"]
 ```
 
 | Phase | Goal | Main Output |
 |---|---|---|
-| **Part 1** | Reproduce Wang et al. MCTNet on California | Baseline OA **85.15%** |
-| **Part 2** | Measure the value of static covariates | Soil and topography help most |
-| **Part 3** | Propose MCTNet-v2 with S1 + S2 fusion | Final OA **86.35%** |
-| **Generalization** | Replicate the pipeline on Arkansas | S2 baseline reaches **91.82%** OA |
+| **Part 1** | Reproduce MCTNet on California and transfer it to Arkansas | CA OA **85.15%**, AR OA **91.82%** |
+| **Part 2** | Measure climate, soil, and topography contributions by region | Soil/topo help CA; AR stays strongest with S2 |
+| **Part 3** | Propose MCTNet-v2 with S2 + S1 + selective static fusion | CA final OA **86.35%**; AR-compatible modules |
+| **Discussion** | Compare why the two regions behave differently | California needs extra context; Arkansas is phenology-driven |
 
 ---
 
@@ -92,7 +95,7 @@ flowchart TB
 
 - 📡 Sentinel-1 is less affected by clouds and captures radar texture, moisture, and flooding patterns.
 - 🔁 Cross-attention aligns 36 Sentinel-2 timesteps with 12 Sentinel-1 monthly composites.
-- 🌱 Soil and topography add useful context for California orchard and rice zones.
+- 🌱 Soil and topography add useful context in California, while Arkansas is mainly driven by Sentinel-2 phenology.
 - 🧊 Climate summaries were excluded from the final model because annual ERA5 averages were too homogeneous in this setup.
 
 ---
@@ -102,34 +105,56 @@ flowchart TB
 ```text
 .
 ├── california/                         # Main California experiment
+│   ├── build_labels_from_cdl.py        # CDL label remapping
 │   ├── GEE_California_Sentinel2.js     # Sentinel-2 sampling/export script
 │   ├── GEE_Export_Map_ROI.js           # ROI/map export utilities
-│   ├── build_labels_from_cdl.py        # CDL label remapping
+│   ├── gee_dataset_preparation_california.py
+│   ├── mctnet_model_paper.py           # Baseline MCTNet reproduction
 │   ├── prepare_dataset.py              # S2 preprocessing and paper-style split
 │   ├── prepare_dataset_multimodal.py   # Multimodal preparation helpers
 │   ├── run_eda_preprocessing.py        # EDA plots and preprocessing checks
-│   ├── mctnet_model_paper.py           # Baseline MCTNet reproduction
 │   ├── Step5_Model_Implementation_MCTNet.ipynb
-│   ├── processed_data/                 # EDA outputs and processed artifacts
 │   └── partie3/                        # MCTNet-v2 multimodal extension
+│       ├── __init__.py
+│       ├── dataset_audit.py            # Dataset integrity checks
+│       ├── debug_shapes.py             # Shape/debug helper
+│       ├── gee_s1_preparation.py       # Sentinel-1 preparation
 │       ├── mctnet_v2_model.py          # Proposed S2 + S1 + static architecture
 │       ├── multimodal_data.py          # S2/S1/static alignment by id
-│       ├── gee_s1_preparation.py       # Sentinel-1 preparation
-│       ├── s2_decadal_composites.py    # S2 composite builder
-│       ├── train_ablation.py           # Part 3 training utilities
+│       ├── paper_dataset.py            # Paper-style split helpers
+│       ├── Partie3_MultiModal_Classification.ipynb
 │       ├── run_partie3_ablation.py     # Multimodal ablation launcher
-│       └── Partie3_MultiModal_Classification.ipynb
+│       ├── s2_decadal_composites.py    # S2 composite builder
+│       ├── s2_pixel_streaming.py       # Pixel streaming utilities
+│       ├── temporal_regularization.py  # Time-series regularization helpers
+│       └── train_ablation.py           # Part 3 training utilities
 │
 ├── Arkanssas/                          # Arkansas transfer/generalization study
+│   ├── README.md
+│   ├── requirements.txt
+│   ├── export_points_from_mctnet_areas.py
 │   ├── gee_dataset_preparation.py
 │   ├── build_s2_training_arrays.py
 │   ├── mctnet_model.py
 │   ├── training_utils.py
-│   ├── notebooks/
-│   └── partie3/
+│   ├── notebooks/                      # Arkansas baseline notebook
+│   └── partie3/                        # Arkansas multimodal utilities
+│       ├── dataset_audit.py
+│       ├── debug_shapes.py
+│       ├── gee_s1_preparation.py
+│       ├── mctnet_v2_model.py
+│       ├── multimodal_data.py
+│       ├── paper_dataset.py
+│       ├── Partie3_MultiModal_Classification.ipynb
+│       ├── s2_decadal_composites.py
+│       ├── s2_pixel_streaming.py
+│       ├── temporal_regularization.py
+│       └── train_ablation.py
 │
 └── README.md
 ```
+
+> Large local artifacts are intentionally **not part of the GitHub tree**: datasets, GEE CSV exports, NumPy arrays, trained weights, rasters, generated plots, PDFs, and report/build outputs are ignored through `.gitignore`.
 
 ---
 
@@ -195,11 +220,21 @@ flowchart LR
 ### Key Findings
 
 - ✅ The MCTNet reproduction matches the reference OA and κ almost exactly.
+- 🌽 Arkansas confirms that the same MCTNet pipeline transfers well to a second crop system.
 - 🌱 Soil features are the most useful static covariates in California.
-- 🗺️ Topography also helps, especially for geographic separation of crop zones.
+- 🗺️ Topography also helps in California, especially for geographic separation of crop zones.
 - 🌦️ Annual climate summaries are weak in this setup and can degrade performance.
 - 📡 Sentinel-1 improves robustness under simulated missing Sentinel-2 observations.
 - 🥇 MCTNet-v2 improves macro F1 most strongly for **Pistachios** and **Almonds**.
+
+### Arkansas Summary
+
+| Model | OA | κ | F1 Macro | Notes |
+|---|---:|---:|---:|---|
+| **MCTNet S2 baseline** | **0.9182** | **0.8977** | **0.9183** | Strong Sentinel-2 phenology |
+| MCTNet S2 ablation run | 0.9100 | - | - | Controlled shorter run |
+| MCTNet + climate | 0.9020 | - | - | No gain |
+| MCTNet + topography | 0.9030 | - | - | No gain |
 
 ---
 
@@ -253,9 +288,9 @@ Or use the notebook:
 california/partie3/Partie3_MultiModal_Classification.ipynb
 ```
 
-## 🧪 Arkansas Generalization
+## 🧪 Arkansas Study
 
-The Arkansas folder contains a second study area used to test transferability of the pipeline. It focuses on five crop classes and follows the same general workflow:
+The Arkansas folder is the second study area, not just a side note. It tests whether the Sentinel-2 pipeline remains strong on a different crop system with five classes: Corn, Cotton, Soybean, Rice, and Others.
 
 ```text
 Arkanssas/
@@ -297,4 +332,4 @@ Project developed for **Master 1 SII - USTHB, Faculty of Computer Science**.
 
 ## 🏁 TL;DR
 
-This repo reproduces MCTNet, studies environmental covariates, and proposes **MCTNet-v2**, a multimodal crop classifier that fuses **Sentinel-2 + Sentinel-1 + soil + topography** to improve crop mapping accuracy and robustness under missing optical observations.
+This repo reproduces MCTNet on **California**, transfers the pipeline to **Arkansas**, studies regional covariate behavior, and proposes **MCTNet-v2**, a multimodal crop classifier that fuses **Sentinel-2 + Sentinel-1 + selective static features** to improve accuracy and robustness under missing optical observations.

@@ -6,6 +6,9 @@ __pycache__/
 
 # Local dataset (very large)
 dataset/
+**/dataset/
+**/data/
+**/processed_data/
 
 # Python
 *.pyc
@@ -25,3 +28,20 @@ docs/
 REPORT_TASKS.md
 latex/
 .codex
+
+# Generated training artifacts and large local exports
+*.npy
+*.npz
+*.h5
+*.weights.h5
+*.keras
+*.ckpt
+*.tif
+*.tiff
+*.csv
+
+# Local papers/resources and generated outputs not intended for GitHub
+Arkanssas/*.pdf
+Arkanssas/partie3/ressources/
+california/partie3/*.png
+california/partie3/*.csv
