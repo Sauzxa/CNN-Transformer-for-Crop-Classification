@@ -42,7 +42,7 @@ def _load_safe_paths(safes_file: Path) -> list[Path]:
         if ln.strip() and not ln.strip().startswith("#")
     ]
     paths = [Path(p) for p in lines]
-    paths.sort(key=lambda p: parse_safe_acquisition_date(p))
+    paths.sort(key=parse_safe_acquisition_date)
     return paths
 
 
